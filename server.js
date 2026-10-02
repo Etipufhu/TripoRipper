@@ -34,6 +34,20 @@ app.get('/tripo.user.js', (req, res) => {
     res.sendFile(path.join(__dirname, 'tripo3d_ripper.user.js'));
 });
 
+function getBrowserExecutable() {
+    const candidates = [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(process.env.LOCALAPPDATA || '', 'Programs\\Opera GX\\opera.exe'),
+        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
+    ];
+    for (const p of candidates) {
+        if (p && fs.existsSync(p)) return p;
+    }
+    return undefined;
+}
+
 let browser = null;
 
 app.post('/api/rip', express.json(), async (req, res) => {
@@ -48,29 +62,48 @@ app.post('/api/rip', express.json(), async (req, res) => {
 
     try {
         if (!browser) {
+            const execPath = getBrowserExecutable();
+            console.log(`[*] Using browser executable: ${execPath || 'Default Chromium'}`);
+
             browser = await puppeteer.launch({
                 headless: false,
                 defaultViewport: null,
-                executablePath: 'C:\\Users\\Etipufhu\\AppData\\Local\\Programs\\Opera GX\\opera.exe',
-                userDataDir: path.join(__dirname, 'opera_profile'),
+                executablePath: execPath,
+                userDataDir: path.join(__dirname, 'chrome_data'),
                 ignoreDefaultArgs: ['--enable-automation'],
                 args: [
                     '--start-maximized',
                     '--disable-blink-features=AutomationControlled',
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-infobars',
                     '--window-position=0,0'
                 ]
             });
         }
 
         const page = await browser.newPage();
-        await page.setBypassCSP(true);
         
         page.on('console', async msg => {
             const text = msg.text();
             console.log('[Browser]', text);
+        });
+
+        // Network sniffer: Intercept original model files directly from network
+        page.on('response', async response => {
+            try {
+                const resUrl = response.url();
+                if (resUrl.includes('tripo-data') && (resUrl.includes('output_mesh_') || resUrl.includes('.glb') || resUrl.includes('.fbx') || resUrl.includes('.obj'))) {
+                    const ext = resUrl.includes('.fbx') ? 'fbx' : (resUrl.includes('.obj') ? 'obj' : 'glb');
+                    const modelId = url.split('/').filter(Boolean).pop() || Date.now();
+                    const filename = `tripo_${modelId}.${ext}`;
+                    const savePath = path.join(DOWNLOADS_DIR, filename);
+                    if (!fs.existsSync(savePath)) {
+                        const buffer = await response.buffer();
+                        fs.writeFileSync(savePath, buffer);
+                        console.log(`\n✅ Original model captured from network: ${savePath} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+                    }
+                }
+            } catch (e) {}
         });
 
         // Tab close function
@@ -85,6 +118,10 @@ app.post('/api/rip', express.json(), async (req, res) => {
         // Inject Smart Ripper Script into the Page
         // ==========================================
         await page.evaluateOnNewDocument((serverPort) => {
+            // Guard: Never run inside Cloudflare verification or third-party iframes
+            if (!window.location.hostname.includes('tripo3d.ai') || window.location.hostname.includes('cloudflare')) {
+                return;
+            }
             window.__tripoRipperInjected = true;
 
             async function sendGlbToServer(blobOrBuffer, filename) {
