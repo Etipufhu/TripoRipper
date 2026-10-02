@@ -105,7 +105,142 @@ app.post('/api/rip', async (req, res) => {
                 }
             }
 
-            // 1. Pack the decoded Three.js Mesh data from RAM as a standard GLB (no EXT_meshopt errors)
+            // Helper: Search for GLB URL in Vue/Pinia state
+            function searchGlbUrl(obj, visited = new Set(), depth = 0) {
+                if (!obj || depth > 20 || visited.has(obj)) return null;
+                if (typeof obj === 'string') {
+                    if (obj.startsWith('http') && (obj.includes('.glb') || obj.includes('pbr_model') || obj.includes('tripo-data'))) return obj;
+                    return null;
+                }
+                if (typeof obj !== 'object') return null;
+                visited.add(obj);
+                for (const k of Object.keys(obj)) {
+                    try {
+                        const res = searchGlbUrl(obj[k], visited, depth + 1);
+                        if (res) return res;
+                    } catch (e) {}
+                }
+                return null;
+            }
+
+            // Helper: Search for Three.js Scene in Vue component tree
+            function searchSceneInVue(inst, visited = new Set(), depth = 0) {
+                if (!inst || depth > 40 || visited.has(inst)) return null;
+                visited.add(inst);
+                if (inst.provides) {
+                    for (const key of Object.keys(inst.provides)) {
+                        const val = inst.provides[key];
+                        if (val?.isScene) return val;
+                        if (val?.scene?.isScene) return val.scene;
+                        if (val?.scene?.value?.isScene) return val.scene.value;
+                    }
+                }
+                const ctx = inst.setupState || inst.proxy || inst.ctx;
+                if (ctx) {
+                    if (ctx.scene?.isScene) return ctx.scene;
+                    if (ctx.scene?.value?.isScene) return ctx.scene.value;
+                    if (ctx.isScene) return ctx;
+                }
+                if (inst.subTree) {
+                    const found = searchVNode(inst.subTree, visited, depth + 1);
+                    if (found) return found;
+                }
+                return null;
+            }
+
+            function searchVNode(vnode, visited = new Set(), depth = 0) {
+                if (!vnode || depth > 40) return null;
+                if (vnode.component) {
+                    const found = searchSceneInVue(vnode.component, visited, depth + 1);
+                    if (found) return found;
+                }
+                if (Array.isArray(vnode.children)) {
+                    for (const child of vnode.children) {
+                        if (child && typeof child === 'object') {
+                            const found = searchVNode(child, visited, depth + 1);
+                            if (found) return found;
+                        }
+                    }
+                }
+                return null;
+            }
+
+            // Helper: Find meshes in scene
+            function findMeshes(obj, list = []) {
+                if (!obj) return list;
+                if (obj.isMesh && obj.geometry?.attributes?.position?.count > 500) list.push(obj);
+                if (obj.children) for (const c of obj.children) findMeshes(c, list);
+                return list;
+            }
+
+            // Helper: Build GLB from mesh and send to server
+            async function buildAndSendGlb(modelMesh) {
+                const geo = modelMesh.geometry, pos = geo.attributes.position.array, uvs = geo.attributes.uv?.array, indices = geo.index?.array;
+                let texBytes = null;
+                const img = modelMesh.material?.map?.image;
+                if (img) {
+                    const c = document.createElement('canvas'); c.width = img.width || 1024; c.height = img.height || 1024;
+                    c.getContext('2d').drawImage(img, 0, 0);
+                    const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+                    texBytes = new Uint8Array(await blob.arrayBuffer());
+                }
+
+                const a4 = n => Math.ceil(n / 4) * 4;
+                const pB = pos.byteLength, uvB = uvs ? a4(uvs.byteLength) : 0, iB = indices ? a4(indices.byteLength) : 0, tB = texBytes ? a4(texBytes.byteLength) : 0;
+                const uvOff = a4(pB), iOff = uvOff + uvB, tOff = iOff + iB, totalBin = a4(tOff + tB);
+
+                let minP = [Infinity, Infinity, Infinity], maxP = [-Infinity, -Infinity, -Infinity];
+                for (let i = 0; i < pos.length; i += 3) {
+                    minP[0] = Math.min(minP[0], pos[i]); minP[1] = Math.min(minP[1], pos[i+1]); minP[2] = Math.min(minP[2], pos[i+2]);
+                    maxP[0] = Math.max(maxP[0], pos[i]); maxP[1] = Math.max(maxP[1], pos[i+1]); maxP[2] = Math.max(maxP[2], pos[i+2]);
+                }
+
+                const bvs = [{ buffer: 0, byteOffset: 0, byteLength: pB, target: 34962 }];
+                const accs = [{ bufferView: 0, byteOffset: 0, componentType: 5126, count: pos.length / 3, type: 'VEC3', min: minP, max: maxP }];
+                const primAttr = { POSITION: 0 };
+
+                if (uvs) {
+                    bvs.push({ buffer: 0, byteOffset: uvOff, byteLength: uvs.byteLength, target: 34962 });
+                    accs.push({ bufferView: bvs.length - 1, byteOffset: 0, componentType: 5126, count: uvs.length / 2, type: 'VEC2' });
+                    primAttr.TEXCOORD_0 = accs.length - 1;
+                }
+                let idxAcc = null;
+                if (indices) {
+                    bvs.push({ buffer: 0, byteOffset: iOff, byteLength: indices.byteLength, target: 34963 });
+                    accs.push({ bufferView: bvs.length - 1, byteOffset: 0, componentType: 5125, count: indices.length, type: 'SCALAR' });
+                    idxAcc = accs.length - 1;
+                }
+                let imgBv = null;
+                if (texBytes) {
+                    imgBv = bvs.length;
+                    bvs.push({ buffer: 0, byteOffset: tOff, byteLength: texBytes.byteLength });
+                }
+
+                const gltf = {
+                    asset: { version: '2.0', generator: 'tripo-blender-standard-glb' }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+                    meshes: [{ primitives: [{ attributes: primAttr, ...(idxAcc !== null ? { indices: idxAcc } : {}), ...(imgBv !== null ? { material: 0 } : {}) }] }],
+                    accessors: accs, bufferViews: bvs, buffers: [{ byteLength: totalBin }],
+                    ...(imgBv !== null ? { materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 0.5 }, doubleSided: true }], textures: [{ source: 0 }], images: [{ mimeType: 'image/png', bufferView: imgBv }] } : {})
+                };
+
+                const jsonEnc = new TextEncoder().encode(JSON.stringify(gltf)), jsonPad = a4(jsonEnc.length);
+                const total = 12 + 8 + jsonPad + 8 + totalBin, glb = new ArrayBuffer(total), dv = new DataView(glb), buf = new Uint8Array(glb);
+                let off = 0;
+                dv.setUint32(off, 0x46546C67, true); off += 4; dv.setUint32(off, 2, true); off += 4; dv.setUint32(off, total, true); off += 4;
+                dv.setUint32(off, jsonPad, true); off += 4; dv.setUint32(off, 0x4E4F534A, true); off += 4;
+                buf.set(jsonEnc, off); for (let i = jsonEnc.length; i < jsonPad; i++) buf[off + i] = 0x20; off += jsonPad;
+                dv.setUint32(off, totalBin, true); off += 4; dv.setUint32(off, 0x004E4942, true); off += 4;
+                const bStart = off;
+                buf.set(new Uint8Array(pos.buffer, pos.byteOffset, pos.byteLength), bStart);
+                if (uvs) buf.set(new Uint8Array(uvs.buffer, uvs.byteOffset, uvs.byteLength), bStart + uvOff);
+                if (indices) buf.set(new Uint8Array(indices.buffer, indices.byteOffset, indices.byteLength), bStart + iOff);
+                if (texBytes) buf.set(texBytes, bStart + tOff);
+
+                const modelId = location.pathname.split('/').filter(Boolean).pop() || 'model';
+                sendGlbToServer(glb, `tripo_${modelId}.glb`);
+            }
+
+            // Main polling loop - tries multiple extraction strategies
             let captured = false;
             let checkCount = 0;
 
@@ -116,47 +251,7 @@ app.post('/api/rip', async (req, res) => {
                 const appEl = document.querySelector('[data-v-app]') || document.querySelector('#__nuxt');
                 if (!appEl || !appEl.__vue_app__) return;
 
-                function searchSceneInVue(inst, visited = new Set(), depth = 0) {
-                    if (!inst || depth > 40 || visited.has(inst)) return null;
-                    visited.add(inst);
-                    if (inst.provides) {
-                        for (const key of Object.keys(inst.provides)) {
-                            const val = inst.provides[key];
-                            if (val?.isScene) return val;
-                            if (val?.scene?.isScene) return val.scene;
-                            if (val?.scene?.value?.isScene) return val.scene.value;
-                        }
-                    }
-                    const ctx = inst.setupState || inst.proxy || inst.ctx;
-                    if (ctx) {
-                        if (ctx.scene?.isScene) return ctx.scene;
-                        if (ctx.scene?.value?.isScene) return ctx.scene.value;
-                        if (ctx.isScene) return ctx;
-                    }
-                    if (inst.subTree) {
-                        const found = searchVNode(inst.subTree, visited, depth + 1);
-                        if (found) return found;
-                    }
-                    return null;
-                }
-
-                function searchVNode(vnode, visited = new Set(), depth = 0) {
-                    if (!vnode || depth > 40) return null;
-                    if (vnode.component) {
-                        const found = searchSceneInVue(vnode.component, visited, depth + 1);
-                        if (found) return found;
-                    }
-                    if (Array.isArray(vnode.children)) {
-                        for (const child of vnode.children) {
-                            if (child && typeof child === 'object') {
-                                const found = searchVNode(child, visited, depth + 1);
-                                if (found) return found;
-                            }
-                        }
-                    }
-                    return null;
-                }
-
+                // A) Try to find scene and extract mesh directly from RAM
                 let targetScene = null;
                 const router = appEl.__vue_app__.config?.globalProperties?.$router;
                 const pageInternal = router?.currentRoute?.value?.matched?.[0]?.instances?.default?._;
@@ -164,12 +259,6 @@ app.post('/api/rip', async (req, res) => {
                 if (!targetScene && appEl.__vue_app__._instance) targetScene = searchSceneInVue(appEl.__vue_app__._instance);
 
                 if (targetScene) {
-                    function findMeshes(obj, list = []) {
-                        if (!obj) return list;
-                        if (obj.isMesh && obj.geometry?.attributes?.position?.count > 500) list.push(obj);
-                        if (obj.children) for (const c of obj.children) findMeshes(c, list);
-                        return list;
-                    }
                     const meshes = findMeshes(targetScene);
                     const modelMesh = meshes.reduce((best, m) => (m.geometry?.attributes?.position?.count ?? 0) > (best?.geometry?.attributes?.position?.count ?? 0) ? m : best, null);
 
@@ -177,98 +266,16 @@ app.post('/api/rip', async (req, res) => {
                         captured = true;
                         clearInterval(checkInterval);
                         console.log('[TripoRipper] Mesh captured from scene! Building Blender-compatible standard GLB...');
-                        
-                        const geo = modelMesh.geometry, pos = geo.attributes.position.array, uvs = geo.attributes.uv?.array, indices = geo.index?.array;
-                        let texBytes = null;
-                        const img = modelMesh.material?.map?.image;
-                        if (img) {
-                            const c = document.createElement('canvas'); c.width = img.width || 1024; c.height = img.height || 1024;
-                            c.getContext('2d').drawImage(img, 0, 0);
-                            const blob = await new Promise(r => c.toBlob(r, 'image/png'));
-                            texBytes = new Uint8Array(await blob.arrayBuffer());
-                        }
-
-                        const a4 = n => Math.ceil(n / 4) * 4;
-                        const pB = pos.byteLength, uvB = uvs ? a4(uvs.byteLength) : 0, iB = indices ? a4(indices.byteLength) : 0, tB = texBytes ? a4(texBytes.byteLength) : 0;
-                        const uvOff = a4(pB), iOff = uvOff + uvB, tOff = iOff + iB, totalBin = a4(tOff + tB);
-
-                        let minP = [Infinity, Infinity, Infinity], maxP = [-Infinity, -Infinity, -Infinity];
-                        for (let i = 0; i < pos.length; i += 3) {
-                            minP[0] = Math.min(minP[0], pos[i]); minP[1] = Math.min(minP[1], pos[i+1]); minP[2] = Math.min(minP[2], pos[i+2]);
-                            maxP[0] = Math.max(maxP[0], pos[i]); maxP[1] = Math.max(maxP[1], pos[i+1]); maxP[2] = Math.max(maxP[2], pos[i+2]);
-                        }
-
-                        const bvs = [{ buffer: 0, byteOffset: 0, byteLength: pB, target: 34962 }];
-                        const accs = [{ bufferView: 0, byteOffset: 0, componentType: 5126, count: pos.length / 3, type: 'VEC3', min: minP, max: maxP }];
-                        const primAttr = { POSITION: 0 };
-
-                        if (uvs) {
-                            bvs.push({ buffer: 0, byteOffset: uvOff, byteLength: uvs.byteLength, target: 34962 });
-                            accs.push({ bufferView: bvs.length - 1, byteOffset: 0, componentType: 5126, count: uvs.length / 2, type: 'VEC2' });
-                            primAttr.TEXCOORD_0 = accs.length - 1;
-                        }
-                        let idxAcc = null;
-                        if (indices) {
-                            bvs.push({ buffer: 0, byteOffset: iOff, byteLength: indices.byteLength, target: 34963 });
-                            accs.push({ bufferView: bvs.length - 1, byteOffset: 0, componentType: 5125, count: indices.length, type: 'SCALAR' });
-                            idxAcc = accs.length - 1;
-                        }
-                        let imgBv = null;
-                        if (texBytes) {
-                            imgBv = bvs.length;
-                            bvs.push({ buffer: 0, byteOffset: tOff, byteLength: texBytes.byteLength });
-                        }
-
-                        const gltf = {
-                            asset: { version: '2.0', generator: 'tripo-blender-standard-glb' }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
-                            meshes: [{ primitives: [{ attributes: primAttr, ...(idxAcc !== null ? { indices: idxAcc } : {}), ...(imgBv !== null ? { material: 0 } : {}) }] }],
-                            accessors: accs, bufferViews: bvs, buffers: [{ byteLength: totalBin }],
-                            ...(imgBv !== null ? { materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 0.5 }, doubleSided: true }], textures: [{ source: 0 }], images: [{ mimeType: 'image/png', bufferView: imgBv }] } : {})
-                        };
-
-                        const jsonEnc = new TextEncoder().encode(JSON.stringify(gltf)), jsonPad = a4(jsonEnc.length);
-                        const total = 12 + 8 + jsonPad + 8 + totalBin, glb = new ArrayBuffer(total), dv = new DataView(glb), buf = new Uint8Array(glb);
-                        let off = 0;
-                        dv.setUint32(off, 0x46546C67, true); off += 4; dv.setUint32(off, 2, true); off += 4; dv.setUint32(off, total, true); off += 4;
-                        dv.setUint32(off, jsonPad, true); off += 4; dv.setUint32(off, 0x4E4F534A, true); off += 4;
-                        buf.set(jsonEnc, off); for (let i = jsonEnc.length; i < jsonPad; i++) buf[off + i] = 0x20; off += jsonPad;
-                        dv.setUint32(off, totalBin, true); off += 4; dv.setUint32(off, 0x004E4942, true); off += 4;
-                        const bStart = off;
-                        buf.set(new Uint8Array(pos.buffer, pos.byteOffset, pos.byteLength), bStart);
-                        if (uvs) buf.set(new Uint8Array(uvs.buffer, uvs.byteOffset, uvs.byteLength), bStart + uvOff);
-                        if (indices) buf.set(new Uint8Array(indices.buffer, indices.byteOffset, indices.byteLength), bStart + iOff);
-                        if (texBytes) buf.set(texBytes, bStart + tOff);
-
-                        const modelId = location.pathname.split('/').filter(Boolean).pop() || 'model';
-                        sendGlbToServer(glb, `tripo_${modelId}.glb`);
+                        await buildAndSendGlb(modelMesh);
+                        return;
                     }
                 }
-            }, 1500);
 
-                // B) Search for URL in state
-                function searchGlbUrl(obj, visited = new Set(), depth = 0) {
-                    if (!obj || depth > 20 || visited.has(obj)) return null;
-                    if (typeof obj === 'string') {
-                        if (obj.startsWith('http') && (obj.includes('.glb') || obj.includes('pbr_model') || obj.includes('tripo-data'))) return obj;
-                        return null;
-                    }
-                    if (typeof obj !== 'object') return null;
-                    visited.add(obj);
-                    for (const k of Object.keys(obj)) {
-                        try {
-                            const res = searchGlbUrl(obj[k], visited, depth + 1);
-                            if (res) return res;
-                        } catch (e) {}
-                    }
-                    return null;
-                }
-
-                const appEl = document.querySelector('[data-v-app]') || document.querySelector('#__nuxt');
+                // B) Search for GLB URL in Vue/Pinia state
                 let foundUrl = null;
-                if (appEl && appEl.__vue_app__) {
-                    const pinia = appEl.__vue_app__.config?.globalProperties?.$pinia;
-                    if (pinia?.state?.value) foundUrl = searchGlbUrl(pinia.state.value);
-                }
+                const pinia = appEl.__vue_app__.config?.globalProperties?.$pinia;
+                if (pinia?.state?.value) foundUrl = searchGlbUrl(pinia.state.value);
+
                 if (foundUrl) {
                     captured = true;
                     clearInterval(checkInterval);
@@ -282,138 +289,17 @@ app.post('/api/rip', async (req, res) => {
                     return;
                 }
 
-                // C) If no link found after 15 attempts, extract mesh directly from scene (RAM)
-                if (checkCount > 5) {
-                    try {
-                        function searchSceneInVue(inst, visited = new Set(), depth = 0) {
-                            if (!inst || depth > 40 || visited.has(inst)) return null;
-                            visited.add(inst);
-                            if (inst.provides) {
-                                for (const key of Object.keys(inst.provides)) {
-                                    const val = inst.provides[key];
-                                    if (val?.isScene) return val;
-                                    if (val?.scene?.isScene) return val.scene;
-                                    if (val?.scene?.value?.isScene) return val.scene.value;
-                                }
-                            }
-                            const ctx = inst.setupState || inst.proxy || inst.ctx;
-                            if (ctx) {
-                                if (ctx.scene?.isScene) return ctx.scene;
-                                if (ctx.scene?.value?.isScene) return ctx.scene.value;
-                                if (ctx.isScene) return ctx;
-                            }
-                            if (inst.subTree) {
-                                const found = searchVNode(inst.subTree, visited, depth + 1);
-                                if (found) return found;
-                            }
-                            return null;
-                        }
+                // C) After several attempts, try scene extraction again as fallback
+                if (checkCount > 5 && targetScene) {
+                    const meshes = findMeshes(targetScene);
+                    const modelMesh = meshes.reduce((best, m) => (m.geometry?.attributes?.position?.count ?? 0) > (best?.geometry?.attributes?.position?.count ?? 0) ? m : best, null);
 
-                        function searchVNode(vnode, visited = new Set(), depth = 0) {
-                            if (!vnode || depth > 40) return null;
-                            if (vnode.component) {
-                                const found = searchSceneInVue(vnode.component, visited, depth + 1);
-                                if (found) return found;
-                            }
-                            if (Array.isArray(vnode.children)) {
-                                for (const child of vnode.children) {
-                                    if (child && typeof child === 'object') {
-                                        const found = searchVNode(child, visited, depth + 1);
-                                        if (found) return found;
-                                    }
-                                }
-                            }
-                            return null;
-                        }
-
-                        let targetScene = null;
-                        if (appEl && appEl.__vue_app__) {
-                            const router = appEl.__vue_app__.config?.globalProperties?.$router;
-                            const pageInternal = router?.currentRoute?.value?.matched?.[0]?.instances?.default?._;
-                            if (pageInternal) targetScene = searchSceneInVue(pageInternal);
-                        }
-
-                        if (targetScene) {
-                            function findMeshes(obj, list = []) {
-                                if (!obj) return list;
-                                if (obj.isMesh && obj.geometry?.attributes?.position?.count > 500) list.push(obj);
-                                if (obj.children) for (const c of obj.children) findMeshes(c, list);
-                                return list;
-                            }
-                            const meshes = findMeshes(targetScene);
-                            const modelMesh = meshes.reduce((best, m) => (m.geometry?.attributes?.position?.count ?? 0) > (best?.geometry?.attributes?.position?.count ?? 0) ? m : best, null);
-
-                            if (modelMesh) {
-                                captured = true;
-                                clearInterval(checkInterval);
-                                console.log('[TripoRipper] Mesh captured from scene! Building GLB...');
-                                
-                                const geo = modelMesh.geometry, pos = geo.attributes.position.array, uvs = geo.attributes.uv?.array, indices = geo.index?.array;
-                                let texBytes = null;
-                                const img = modelMesh.material?.map?.image;
-                                if (img) {
-                                    const c = document.createElement('canvas'); c.width = img.width || 1024; c.height = img.height || 1024;
-                                    c.getContext('2d').drawImage(img, 0, 0);
-                                    const blob = await new Promise(r => c.toBlob(r, 'image/png'));
-                                    texBytes = new Uint8Array(await blob.arrayBuffer());
-                                }
-
-                                const a4 = n => Math.ceil(n / 4) * 4;
-                                const pB = pos.byteLength, uvB = uvs ? a4(uvs.byteLength) : 0, iB = indices ? a4(indices.byteLength) : 0, tB = texBytes ? a4(texBytes.byteLength) : 0;
-                                const uvOff = a4(pB), iOff = uvOff + uvB, tOff = iOff + iB, totalBin = a4(tOff + tB);
-
-                                let minP = [Infinity, Infinity, Infinity], maxP = [-Infinity, -Infinity, -Infinity];
-                                for (let i = 0; i < pos.length; i += 3) {
-                                    minP[0] = Math.min(minP[0], pos[i]); minP[1] = Math.min(minP[1], pos[i+1]); minP[2] = Math.min(minP[2], pos[i+2]);
-                                    maxP[0] = Math.max(maxP[0], pos[i]); maxP[1] = Math.max(maxP[1], pos[i+1]); maxP[2] = Math.max(maxP[2], pos[i+2]);
-                                }
-
-                                const bvs = [{ buffer: 0, byteOffset: 0, byteLength: pB, target: 34962 }];
-                                const accs = [{ bufferView: 0, byteOffset: 0, componentType: 5126, count: pos.length / 3, type: 'VEC3', min: minP, max: maxP }];
-                                const primAttr = { POSITION: 0 };
-
-                                if (uvs) {
-                                    bvs.push({ buffer: 0, byteOffset: uvOff, byteLength: uvs.byteLength, target: 34962 });
-                                    accs.push({ bufferView: bvs.length - 1, byteOffset: 0, componentType: 5126, count: uvs.length / 2, type: 'VEC2' });
-                                    primAttr.TEXCOORD_0 = accs.length - 1;
-                                }
-                                let idxAcc = null;
-                                if (indices) {
-                                    bvs.push({ buffer: 0, byteOffset: iOff, byteLength: indices.byteLength, target: 34963 });
-                                    accs.push({ bufferView: bvs.length - 1, byteOffset: 0, componentType: 5125, count: indices.length, type: 'SCALAR' });
-                                    idxAcc = accs.length - 1;
-                                }
-                                let imgBv = null;
-                                if (texBytes) {
-                                    imgBv = bvs.length;
-                                    bvs.push({ buffer: 0, byteOffset: tOff, byteLength: texBytes.byteLength });
-                                }
-
-                                const gltf = {
-                                    asset: { version: '2.0' }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
-                                    meshes: [{ primitives: [{ attributes: primAttr, ...(idxAcc !== null ? { indices: idxAcc } : {}), ...(imgBv !== null ? { material: 0 } : {}) }] }],
-                                    accessors: accs, bufferViews: bvs, buffers: [{ byteLength: totalBin }],
-                                    ...(imgBv !== null ? { materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 0.5 }, doubleSided: true }], textures: [{ source: 0 }], images: [{ mimeType: 'image/png', bufferView: imgBv }] } : {})
-                                };
-
-                                const jsonEnc = new TextEncoder().encode(JSON.stringify(gltf)), jsonPad = a4(jsonEnc.length);
-                                const total = 12 + 8 + jsonPad + 8 + totalBin, glb = new ArrayBuffer(total), dv = new DataView(glb), buf = new Uint8Array(glb);
-                                let off = 0;
-                                dv.setUint32(off, 0x46546C67, true); off += 4; dv.setUint32(off, 2, true); off += 4; dv.setUint32(off, total, true); off += 4;
-                                dv.setUint32(off, jsonPad, true); off += 4; dv.setUint32(off, 0x4E4F534A, true); off += 4;
-                                buf.set(jsonEnc, off); for (let i = jsonEnc.length; i < jsonPad; i++) buf[off + i] = 0x20; off += jsonPad;
-                                dv.setUint32(off, totalBin, true); off += 4; dv.setUint32(off, 0x004E4942, true); off += 4;
-                                const bStart = off;
-                                buf.set(new Uint8Array(pos.buffer, pos.byteOffset, pos.byteLength), bStart);
-                                if (uvs) buf.set(new Uint8Array(uvs.buffer, uvs.byteOffset, uvs.byteLength), bStart + uvOff);
-                                if (indices) buf.set(new Uint8Array(indices.buffer, indices.byteOffset, indices.byteLength), bStart + iOff);
-                                if (texBytes) buf.set(texBytes, bStart + tOff);
-
-                                const modelId = location.pathname.split('/').filter(Boolean).pop() || 'model';
-                                sendGlbToServer(glb, `tripo_${modelId}.glb`);
-                            }
-                        }
-                    } catch (err) {}
+                    if (modelMesh) {
+                        captured = true;
+                        clearInterval(checkInterval);
+                        console.log('[TripoRipper] Mesh captured from scene (fallback)! Building GLB...');
+                        await buildAndSendGlb(modelMesh);
+                    }
                 }
             }, 2000);
         }, PORT);
