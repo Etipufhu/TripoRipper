@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tripo3D 3D Model Ripper</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+        .container { background-color: #1e1e1e; padding: 2.2rem; border-radius: 12px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); width: 100%; max-width: 540px; border: 1px solid #2a2a2a; }
+        h1 { margin-top: 0; color: #10b981; font-size: 1.6rem; text-align: center; }
+        p { color: #aaaaaa; font-size: 0.9rem; text-align: center; margin-bottom: 1.8rem; }
+        input[type="text"] { width: 100%; padding: 12px; margin-bottom: 1rem; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: white; box-sizing: border-box; font-size: 0.95rem; }
+        input[type="text"]:focus { outline: none; border-color: #10b981; }
+        button.primary-btn { width: 100%; padding: 12px; background-color: #10b981; color: #121212; border: none; border-radius: 6px; font-weight: bold; font-size: 1rem; cursor: pointer; transition: background-color 0.2s, transform 0.1s; }
+        button.primary-btn:hover { background-color: #059669; }
+        button.primary-btn:disabled { background-color: #444; color: #888; cursor: not-allowed; }
+        #status { margin-top: 1rem; padding: 12px; border-radius: 6px; display: none; text-align: center; font-size: 0.9rem; font-weight: 500; }
+        .info { background-color: #262626; border-left: 4px solid #10b981; padding: 12px; margin-top: 1.4rem; font-size: 0.85rem; color: #ccc; line-height: 1.5; border-radius: 0 6px 6px 0; }
+        .links-bar { margin-top: 1.2rem; text-align: center; font-size: 0.82rem; }
+        .links-bar a { color: #10b981; text-decoration: none; font-weight: 600; margin: 0 8px; }
+        .links-bar a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Tripo3D Model Ripper</h1>
+        <p>Paste the Tripo3D model URL and wait.</p>
+        
+        <input type="text" id="urlInput" placeholder="e.g. https://studio.tripo3d.ai/3d-model/52d63b42-c046-4bc8-...">
+        <button id="ripBtn" class="primary-btn" onclick="startRip()">Download Model</button>
+        
+        <div id="status"></div>
+        
+        <div class="info">
+            <strong>How Does It Work?</strong><br>
+            When you click "Download Model", Opera GX will open. As soon as the model is loaded on screen and decoded in the scene, the GLB file will automatically be downloaded to the <strong>tripo_ripper/downloads/</strong> folder and the tab will close automatically.
+        </div>
+
+        <div class="links-bar">
+            <span>Alternative:</span>
+            <a href="/tripo.user.js" target="_blank">📥 Tampermonkey Extension</a>
+        </div>
+    </div>
+
+    <script>
+        async function startRip() {
+            const urlInput = document.getElementById('urlInput');
+            const btn = document.getElementById('ripBtn');
+            const status = document.getElementById('status');
+            const url = urlInput.value.trim();
+
+            if (!url) {
+                showStatus('Please enter a URL.', 'red');
+                return;
+            }
+
+            if (!url.includes('tripo3d.ai')) {
+                showStatus('Please enter a valid tripo3d.ai URL.', 'red');
+                return;
+            }
+
+            btn.disabled = true;
+            showStatus('Opening browser...', '#10b981');
+
+            try {
+                const response = await fetch('/api/rip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showStatus('Browser opened. Scanning model, tab will close when download is complete...', '#10b981');
+                } else {
+                    showStatus('Error: ' + data.error, '#ff4444');
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                showStatus('Could not reach the server. Make sure the server (start.bat) is running.', '#ff4444');
+                btn.disabled = false;
+            }
+        }
+
+        function showStatus(message, color) {
+            const status = document.getElementById('status');
+            status.style.display = 'block';
+            status.style.backgroundColor = color === 'red' ? '#ff444422' : '#10b98122';
+            status.style.color = color === 'red' ? '#ff5555' : '#10b981';
+            status.style.border = `1px solid ${color === 'red' ? '#ff444455' : '#10b98155'}`;
+            status.textContent = message;
+        }
+    </script>
+</body>
+</html>
