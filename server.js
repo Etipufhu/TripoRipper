@@ -15,7 +15,6 @@ if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true
 
 app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.json());
 
 // GLB Save Endpoint (Both Puppeteer and Tampermonkey/Console can POST here)
 app.post('/api/save_glb', express.raw({ type: '*/*', limit: '500mb' }), (req, res) => {
@@ -37,7 +36,7 @@ app.get('/tripo.user.js', (req, res) => {
 
 let browser = null;
 
-app.post('/api/rip', async (req, res) => {
+app.post('/api/rip', express.json(), async (req, res) => {
     const { url } = req.body;
     
     if (!url || !url.includes('tripo3d.ai')) {
