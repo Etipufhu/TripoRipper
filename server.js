@@ -69,7 +69,6 @@ app.post('/api/rip', express.json(), async (req, res) => {
                 headless: false,
                 defaultViewport: null,
                 executablePath: execPath,
-                userDataDir: path.join(__dirname, 'chrome_data'),
                 ignoreDefaultArgs: ['--enable-automation'],
                 args: [
                     '--start-maximized',
@@ -101,6 +100,9 @@ app.post('/api/rip', express.json(), async (req, res) => {
                         const buffer = await response.buffer();
                         fs.writeFileSync(savePath, buffer);
                         console.log(`\n✅ Original model captured from network: ${savePath} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+                        setTimeout(async () => {
+                            try { await page.close(); } catch(e) {}
+                        }, 2500);
                     }
                 }
             } catch (e) {}
@@ -343,6 +345,31 @@ app.post('/api/rip', express.json(), async (req, res) => {
         // Navigate to page
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
         console.log('Page opened. Scanning and waiting for the model...');
+
+        // Cloudflare Turnstile Auto-Solver Fallback
+        setTimeout(async () => {
+            try {
+                if (page.isClosed()) return;
+                const title = await page.title();
+                if (title.includes('Just a moment')) {
+                    console.log('[*] Cloudflare Turnstile detected. Attempting auto-verification...');
+                    const frames = page.frames();
+                    const cfFrame = frames.find(f => f.url().includes('challenges.cloudflare.com'));
+                    if (cfFrame) {
+                        const checkbox = await cfFrame.$('input[type="checkbox"], #challenge-stage, .ctp-checkbox-label');
+                        if (checkbox) {
+                            const box = await checkbox.boundingBox();
+                            if (box) {
+                                await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                                console.log('[*] Cloudflare checkbox clicked.');
+                            } else {
+                                await checkbox.click();
+                            }
+                        }
+                    }
+                }
+            } catch(e) {}
+        }, 2500);
 
     } catch (error) {
         console.error('Error occurred:', error);
